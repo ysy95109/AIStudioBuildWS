@@ -25,6 +25,58 @@ class AppReadinessError(Exception):
     pass
 
 
+class PreviewAuthenticationError(AppReadinessError):
+    """The Google error document rendered in place of the app Preview."""
+
+
+def _check_preview_authentication(page: Page, deadline):
+    # Error documents may use a different iframe title than the working app.
+    # Inspect rendered frames instead of relying on iframe[title="Preview"].
+    for frame in page.frames:
+        if time.monotonic() >= deadline:
+            return
+        try:
+            current = frame
+            visible = True
+            while current.parent_frame is not None:
+                element = current.frame_element()
+                try:
+                    visible = element.is_visible()
+                finally:
+                    element.dispose()
+                if not visible:
+                    break
+                current = current.parent_frame
+            if not visible:
+                continue
+            remaining_ms = max(1, min(250, (deadline - time.monotonic()) * 1000))
+            text = frame.locator("body").inner_text(timeout=remaining_ms)
+            normalized = " ".join(text.replace("’", "'").split())
+            if not (
+                re.match(r"^(?:Google\s+)?401\.\s+That's an error\.", normalized)
+                and "The server cannot process the request because it is malformed." in normalized
+                and "It should not be retried." in normalized
+                and "That's all we know." in normalized
+            ):
+                continue
+            branded = frame.locator(
+                '[aria-label="Google"], img[alt="Google"], '
+                'a[href="//www.google.com/"], a[href="https://www.google.com/"]'
+            ).count() or normalized.startswith("Google ") or "!!1" in frame.title()
+            if branded:
+                raise PreviewAuthenticationError(
+                    "Google Preview 返回 401 错误页，应用未启动；"
+                    "请使用正常浏览器中可加载此 Preview 的账号重新导出 JSON Cookie，"
+                    "替换对应 USER_COOKIE 环境变量后重建容器以加载凭证。"
+                    "此错误发生在 Preview 文档加载阶段，尚未运行应用内的 WebSocket。"
+                )
+        except PreviewAuthenticationError:
+            raise
+        except Exception:
+            # A frame can be detached/replaced while the editor renders.
+            continue
+
+
 def _visible_dialogs(page: Page):
     dialogs = []
     containers = page.locator(DIALOG_SELECTOR)
@@ -144,10 +196,24 @@ def wait_for_app_ready(page: Page, logger=None, timeout=30) -> str:
     last_status = "UNKNOWN"
     preview_visible = False
     blocking = False
+    auth_error = None
+    auth_error_since = None
     while time.monotonic() < deadline:
         # One action per poll keeps repeated buttons within the real deadline.
         dismiss_popups(page, logger, max_iterations=1, deadline=deadline)
         blocking = has_visible_dialog(page)
+        try:
+            if not blocking:
+                _check_preview_authentication(page, deadline)
+            auth_error = None
+            auth_error_since = None
+        except PreviewAuthenticationError as error:
+            auth_error = error
+            if auth_error_since is None:
+                auth_error_since = time.monotonic()
+            # Let onboarding/auth bootstrap replace a transient error document.
+            if time.monotonic() - auth_error_since >= 1:
+                raise
         preview = page.locator('iframe[title="Preview"]').first
         preview_visible = preview.is_visible()
         loading = page.locator('mat-spinner:visible, [role="progressbar"]:visible').count() > 0
@@ -155,7 +221,7 @@ def wait_for_app_ready(page: Page, logger=None, timeout=30) -> str:
         now = time.monotonic()
         if now >= deadline:
             break
-        if not blocking and not loading and preview_visible:
+        if not blocking and not loading and preview_visible and auth_error is None:
             if last_status == "CONNECTED":
                 if clear_since is None:
                     clear_since = now
@@ -170,6 +236,8 @@ def wait_for_app_ready(page: Page, logger=None, timeout=30) -> str:
         else:
             clear_since = None
         page.wait_for_timeout(min(200, max(0, deadline - time.monotonic()) * 1000))
+    if auth_error is not None:
+        raise auth_error
     raise AppReadinessError(
         f"AI Studio 未准备就绪: blocking_dialog={blocking}, "
         f"preview_visible={preview_visible}, WS={last_status}"

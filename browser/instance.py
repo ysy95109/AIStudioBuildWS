@@ -9,7 +9,7 @@ from playwright.sync_api import TimeoutError, Error as PlaywrightError
 from utils.logger import setup_logging
 from utils.cookie_manager import CookieManager
 from browser.navigation import handle_successful_navigation, KeepAliveError
-from browser.dialogs import wait_for_app_ready, AppReadinessError
+from browser.dialogs import wait_for_app_ready, AppReadinessError, PreviewAuthenticationError
 from browser.cookie_validator import CookieValidator
 from camoufox.sync_api import Camoufox
 from utils.paths import logs_dir
@@ -339,6 +339,12 @@ def run_browser_instance(config, shutdown_event=None):
                 logger.info("正在等待 AI Studio 弹窗清理、Preview 加载和 WS 连接...")
                 try:
                     wait_for_app_ready(page, logger, timeout=30)
+                except PreviewAuthenticationError:
+                    try:
+                        page.screenshot(path=os.path.join(screenshot_dir, f"FAIL_preview_auth_{diagnostic_tag}.png"))
+                    except Exception as screenshot_error:
+                        logger.warning(f"保存 Preview 认证失败截图时出错: {screenshot_error}")
+                    raise
                 except AppReadinessError as error:
                     logger.error(str(error))
                     page.screenshot(path=os.path.join(screenshot_dir, f"FAIL_app_not_ready_{diagnostic_tag}.png"))
@@ -437,6 +443,10 @@ def run_browser_instance(config, shutdown_event=None):
                 retry_count = 0
                 return
 
+        except PreviewAuthenticationError as error:
+            logger.error(str(error))
+            logger.error("停止自动重试此实例；请更新 Cookie 来源后重新创建容器")
+            return
         except KeepAliveError as e:
             # 如果是 API 连续认证失败引发的重启，自动清理损坏的 Profile 缓存
             # 注意：保留 fingerprint.json 保持指纹一致，只清理 session/cookies 缓存

@@ -5,7 +5,7 @@ from playwright.sync_api import Page
 from utils.paths import logs_dir
 from utils.common import ensure_dir
 from browser.ws_helper import reconnect_ws, get_ws_status, dismiss_interaction_modal, click_in_iframe
-from browser.dialogs import dismiss_popups, has_visible_dialog, wait_for_app_ready, AppReadinessError
+from browser.dialogs import dismiss_popups, has_visible_dialog, wait_for_app_ready, AppReadinessError, PreviewAuthenticationError
 
 class KeepAliveError(Exception):
     pass
@@ -55,6 +55,14 @@ def handle_successful_navigation(page: Page, logger, cookie_file_config, shutdow
     # 在截图前再次验证，处理初始化后异步出现的 onboarding。
     try:
         last_ws_status = wait_for_app_ready(page, logger)
+    except PreviewAuthenticationError:
+        try:
+            screenshot_dir = logs_dir()
+            ensure_dir(screenshot_dir)
+            page.screenshot(path=os.path.join(screenshot_dir, f"FAIL_preview_auth_{cookie_file_config}.png"))
+        except Exception as error:
+            logger.warning(f"保存 Preview 认证失败截图时出错: {error}")
+        raise
     except AppReadinessError as error:
         raise KeepAliveError(str(error)) from error
     logger.info("AI Studio 弹窗已清理，Preview 已加载且 WS 已连接")

@@ -1,10 +1,11 @@
 import time
 import os
 from datetime import datetime, timezone, timedelta
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Page
 from utils.paths import logs_dir
 from utils.common import ensure_dir
 from browser.ws_helper import reconnect_ws, get_ws_status, dismiss_interaction_modal, click_in_iframe
+from browser.dialogs import dismiss_popups, has_visible_dialog, wait_for_app_ready, AppReadinessError
 
 class KeepAliveError(Exception):
     pass
@@ -44,64 +45,19 @@ def _daily_restart_due(last_restart_ts: float, stagger_key: str = "") -> bool:
     return now >= slot and last_restart_ts < slot.timestamp()
 
 def handle_popup_dialog(page: Page, logger=None):
-    """
-    检查并处理所有弹窗/模态框。
-    支持Google AI Studio常见弹窗（Terms、Tutorial、Got it、Continue等）。
-    """
-    # 定义需要查找的按钮列表（按优先级排序）
-    button_names = [
-        "Continue",            # Terms/法律条款弹窗
-        "Continue to the app", # 欢迎/介绍弹窗
-        "Got it",              # 提示弹窗
-        "Got it, thanks",      # 感谢提示
-        "Agree",               # cookie横幅
-        "Dismiss",             # 通知横幅关闭按钮
-        "OK",                  # 通用确认
-        "Accept",              # 接受
-        "I agree",             # 同意
-    ]
-    max_iterations = 5 # 减少迭代次数，避免卡太久
-    total_clicks = 0
-
-    try:
-        for iteration in range(max_iterations):
-            clicked_in_round = False
-            # 缩短等待时间，让其更顺滑
-            time.sleep(0.5)
-
-            for button_name in button_names:
-                try:
-                    button_locator = page.locator(
-                        f'button:visible:has-text("{button_name}"):not([disabled])'
-                    )
-                    if button_locator.count() > 0 and button_locator.first.is_visible():
-                        if logger:
-                            logger.info(f"检测到弹窗按钮: '{button_name}'，正在点击...")
-                        button_locator.first.click(timeout=2000)
-                        total_clicks += 1
-                        clicked_in_round = True
-                        time.sleep(1)
-                except Exception:
-                    pass
-
-            if not clicked_in_round:
-                break
-
-        if total_clicks > 0:
-            logger.info(f"弹窗处理完成, 共点击 {total_clicks} 次")
-
-    except Exception as e:
-        logger.info(f"检查弹窗时发生意外：{e}，将继续执行...")
+    """启动和保活使用同一套弹窗处理，避免 UI 更新后行为不一致。"""
+    return dismiss_popups(page, logger)
 
 def handle_successful_navigation(page: Page, logger, cookie_file_config, shutdown_event=None, cookie_validator=None, expected_path=None, expected_url=None, auth_failure_count=None, auth_failure_threshold=3):
     """
     在成功导航到目标页面后，执行后续操作（处理弹窗、保持运行）。
     """
-    logger.info("已成功到达目标页面")
-    page.click('body') # 给予页面焦点
-
-    # 检查并处理弹窗
-    handle_popup_dialog(page, logger=logger)
+    # 在截图前再次验证，处理初始化后异步出现的 onboarding。
+    try:
+        last_ws_status = wait_for_app_ready(page, logger)
+    except AppReadinessError as error:
+        raise KeepAliveError(str(error)) from error
+    logger.info("AI Studio 弹窗已清理，Preview 已加载且 WS 已连接")
 
     # 保存登录成功截图
     try:
@@ -120,20 +76,8 @@ def handle_successful_navigation(page: Page, logger, cookie_file_config, shutdow
 
     logger.info("实例将保持运行状态。每10秒点击一次页面以保持活动")
 
-    # 等待页面加载和渲染
-    time.sleep(15)
-
-    # 【兜底检查】：再次处理可能延迟出现的弹窗 (如 Terms/Continue 异步加载)
-    for _ in range(3):
-        handle_popup_dialog(page, logger=logger)
-        time.sleep(1)
-
-    # 【重要兜底】：在保活循环开始前再检查一次可能被忽略的遮罩或弹窗
-    handle_popup_dialog(page, logger=logger)
-
-    # 记录初始WS状态
-    last_ws_status = get_ws_status(page, logger)
     logger.info(f"初始WS状态: {last_ws_status}")
+    next_reconnect_at = 0
 
     # 每日定时重启基线：本次会话的启动时间
     last_restart_ts = time.time()
@@ -189,23 +133,24 @@ def handle_successful_navigation(page: Page, logger, cookie_file_config, shutdow
             # 检测并关闭interaction-modal遮罩层（如果出现）
             dismiss_interaction_modal(page, logger)
 
-            # 在iframe内随机移动并点击保活
-            click_in_iframe(page, logger)
+            # 遇到尚未识别的弹窗时，避免随机点击其内容。
+            blocked = has_visible_dialog(page)
+            if blocked:
+                logger.warning("AI Studio 仍有阻挡弹窗，暂缓 Preview 点击")
+            else:
+                click_in_iframe(page, logger)
             click_counter += 1
 
             # 检查WS状态是否发生变化
             current_ws_status = get_ws_status(page, logger)
             if current_ws_status != last_ws_status:
                 logger.warning(f"WS状态变更: {last_ws_status} -> {current_ws_status}")
-                
-                # 如果不是CONNECTED状态，尝试重连
-                if current_ws_status != "CONNECTED":
-                    logger.info("WS断开，尝试重连...")
-                    new_status = reconnect_ws(page, logger)
-                    # reconnect_ws 已自行打印结果，这里只更新记录
-                    current_ws_status = new_status
-                
-                last_ws_status = current_ws_status
+            # 持续 UNKNOWN/IDLE 同样需要重试，不能只在状态变化时恢复。
+            if not blocked and current_ws_status != "CONNECTED" and time.monotonic() >= next_reconnect_at:
+                logger.info("WS未连接，尝试重连...")
+                current_ws_status = reconnect_ws(page, logger)
+                next_reconnect_at = time.monotonic() + 30
+            last_ws_status = current_ws_status
 
             # 每360次点击（1小时）执行一次完整的Cookie验证
             if cookie_validator and click_counter >= 360:  # 360 * 10秒 = 3600秒 = 1小时

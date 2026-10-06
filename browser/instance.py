@@ -9,6 +9,7 @@ from playwright.sync_api import TimeoutError, Error as PlaywrightError
 from utils.logger import setup_logging
 from utils.cookie_manager import CookieManager
 from browser.navigation import handle_successful_navigation, KeepAliveError
+from browser.dialogs import wait_for_app_ready, AppReadinessError
 from browser.cookie_validator import CookieValidator
 from camoufox.sync_api import Camoufox
 from utils.paths import logs_dir
@@ -328,245 +329,20 @@ def run_browser_instance(config, shutdown_event=None):
 
                 logger.info(f"URL验证通过。目标路径: {mask_path_for_logging(expected_path)}")
 
-                # 2 & 3. 增强版智能等待：弹窗稳定检测 + 最上层交互 + 点击有效性反馈（轮询模式）
-                logger.info("正在进入增强版智能等待：弹窗稳定 + 最上层点击 + 死循环防护 (最长30秒)...")
-                target_button_names = [
-                    "Continue",
-                    "Continue to app",
-                    "Continue to the app",
-                    "Connect",
-                    "确认连接", "连接", "继续",
-                    "Dismiss", "Got it", "OK", "Accept", "I agree"
-                ]
-
-                # ========== 阶段 1：弹窗稳定期 (Debounce) ==========
-                # 连续检测2秒，确认没有新的弹窗/overlay再冒出来
-                prev_dialog_count = -1
-                stable_ticks = 0
-                DEBOUNCE_GOAL = 2  # 目标：连续2秒弹窗数量不变
-                for _ in range(10):  # 最多等待10秒
-                    curr_count = page.evaluate("""() => {
-                        return document.querySelectorAll(
-                            'mat-mdc-dialog-container, .cdk-overlay-pane, [role="dialog"], ms-g1-welcome-dialog'
-                        ).length;
-                    }""")
-                    if curr_count == prev_dialog_count:
-                        stable_ticks += 1
-                    else:
-                        stable_ticks = 0
-                        prev_dialog_count = curr_count
-                        logger.info(f"  弹窗/遮罩层数量变化: {curr_count}，重置稳定计数")
-                    if stable_ticks >= DEBOUNCE_GOAL:
-                        logger.info(f"  弹窗已稳定（连续{DEBOUNCE_GOAL}秒无变化，当前{prev_dialog_count}层），开始扫描")
-                        break
-                    page.wait_for_timeout(1000)
-                else:
-                    logger.warning("  弹窗稳定期未完全达标，将强制继续...")
-
-                # ========== 阶段 2：每秒重新扫描 + 最上层点击 + 点击有效性检测 ==========
-                wait_time = 0
-                max_wait = 30
-                # 记录每个按钮的连续无效点击次数，超过3次则跳过
-                click_fail_count = {}  # btn_name -> int
-                # 记录上一轮被判定为"无效"的按钮，下一轮优先尝试其他
-                skip_set = set()
-
-                while wait_time < max_wait:
-                    # ---- 每轮循环开始：强制重新扫描，不缓存任何定位器 ----
-                    # 先检测最上层弹窗是否变化
-                    top_dialog_info = page.evaluate("""() => {
-                        const dialogs = Array.from(document.querySelectorAll(
-                            'mat-mdc-dialog-container, .cdk-overlay-pane, [role="dialog"], ms-g1-welcome-dialog'
-                        )).filter(el => {
-                            const rect = el.getBoundingClientRect();
-                            return rect.width > 0 && rect.height > 0;
-                        });
-                        if (dialogs.length === 0) return null;
-                        const top = dialogs[dialogs.length - 1];
-                        return {
-                            tag: top.tagName,
-                            class: top.className,
-                            id: top.id,
-                            hasContinue: !!top.querySelector('button, [role="button"]'),
-                        };
-                    }""")
-
-                    clicked_any = False
-                    candidate_found = None
-
-                    # 遍历所有候选按钮，但优先尝试非 skip_set 中的
-                    search_order = [b for b in target_button_names if b not in skip_set] + \
-                                   [b for b in target_button_names if b in skip_set]
-
-                    for btn_name in search_order:
-                        # 如果该按钮已连续无效点击3次，本轮跳过
-                        if click_fail_count.get(btn_name, 0) >= 3:
-                            continue
-
-                        try:
-                            # 策略1: get_by_role (标准 button)
-                            btn = page.get_by_role("button", name=btn_name, exact=True)
-                            count = btn.count()
-                            if count > 0:
-                                # 遍历所有匹配项，找出最上层的那个
-                                for nth in range(count):
-                                    handle = btn.nth(nth)
-                                    if not handle.is_visible(timeout=100):
-                                        continue
-                                    box = handle.bounding_box()
-                                    if not box or box['width'] <= 0 or box['height'] <= 0:
-                                        continue
-                                    # 命中测试：检查中心点是否被该元素占据
-                                    cx = box['x'] + box['width'] / 2
-                                    cy = box['y'] + box['height'] / 2
-                                    # 直接把 ElementHandle 传进 JS，避免用浏览器不支持的 :has-text 重新查询
-                                    is_on_top = page.evaluate("""({element, x, y}) => {
-                                        if (!element) return false;
-                                        const top = document.elementFromPoint(x, y);
-                                        return top === element || element.contains(top);
-                                    }""", {"element": handle.element_handle(), "x": cx, "y": cy})
-                                    if is_on_top:
-                                        candidate_found = ("role", btn_name, handle, nth)
-                                        break
-                                if candidate_found:
-                                    break
-
-                            # 策略2: 文本底平 (非标准 button，如 div[role="button"])
-                            text_btn = page.locator(
-                                f'button:has-text("{btn_name}"), '
-                                f'[role="button"]:has-text("{btn_name}"), '
-                                f'button:text-is("{btn_name}")'
-                            )
-                            count = text_btn.count()
-                            if count > 0:
-                                for nth in range(count):
-                                    handle = text_btn.nth(nth)
-                                    if not handle.is_visible(timeout=100):
-                                        continue
-                                    box = handle.bounding_box()
-                                    if not box or box['width'] <= 0 or box['height'] <= 0:
-                                        continue
-                                    # 命中测试
-                                    cx = box['x'] + box['width'] / 2
-                                    cy = box['y'] + box['height'] / 2
-                                    # 使用 JS 获取实际元素判断（btn_name 通过 dict 传入，Playwright 只接受单个 arg）
-                                    is_on_top = page.evaluate("""({x, y, btnName}) => {
-                                        const top = document.elementFromPoint(x, y);
-                                        if (!top) return false;
-                                        // 向上遍历，看是否在按钮元素内
-                                        let el = top;
-                                        while (el) {
-                                            if (el.getAttribute('role') === 'button' || el.tagName === 'BUTTON') {
-                                                return el.textContent.trim().includes(btnName);
-                                            }
-                                            el = el.parentElement;
-                                        }
-                                        return false;
-                                    }""", {"x": cx, "y": cy, "btnName": btn_name})
-                                    if is_on_top:
-                                        candidate_found = ("text", btn_name, handle, nth)
-                                        break
-                                if candidate_found:
-                                    break
-
-                        except Exception:
-                            continue
-
-                    if candidate_found:
-                        strategy, btn_name, btn_handle, nth = candidate_found
-                        logger.info(f"发现可见按钮 [{btn_name}] (策略: {strategy}, 第{nth}个，已通过命中测试)")
-
-                        # 执行点击
-                        click_success = False
-                        try:
-                            btn_handle.click(force=True, timeout=2000)
-                            click_success = True
-                        except Exception as e1:
-                            logger.debug(f"标准点击失败: {e1}")
-                            try:
-                                page.evaluate("(el) => { if(el) el.click(); }", btn_handle.element_handle())
-                                click_success = True
-                            except Exception as e2:
-                                logger.debug(f"JS 点击也失败: {e2}")
-
-                        if click_success:
-                            logger.info(f"成功点击按钮 [{btn_name}]")
-                            page.wait_for_timeout(1500)
-
-                            # ---- 点击有效性检测：看是否解决了问题 ----
-                            # 检查该按钮是否还在页面上（如果是弹窗内的按钮，弹窗关闭后就会消失）
-                            try:
-                                still_visible = btn_handle.is_visible(timeout=500)
-                            except Exception:
-                                still_visible = False
-
-                            if still_visible:
-                                # 点击了但按钮还在，可能是被遮挡/无效点击
-                                click_fail_count[btn_name] = click_fail_count.get(btn_name, 0) + 1
-                                logger.warning(
-                                    f"点击按钮 [{btn_name}] 后按钮仍然可见 (无效次数: {click_fail_count[btn_name]}/3)"
-                                )
-                                if click_fail_count[btn_name] >= 3:
-                                    logger.warning(f"  按钮 [{btn_name}] 连续3次无效，加入跳过列表，下一轮尝试其他按钮")
-                                    skip_set.add(btn_name)
-                                # 点击后给予短暂休息，但不立即 continue，让 spinner 检查有机会跳出
-                            else:
-                                # 点击有效，按钮消失了
-                                logger.info(f"  按钮 [{btn_name}] 消失，点击有效，重置其失败计数")
-                                click_fail_count[btn_name] = 0
-                                if btn_name in skip_set:
-                                    skip_set.remove(btn_name)
-
-                            clicked_any = True
-                            # 点击后立即进入下一轮循环（检查 spinner 或新弹窗）
-                            continue
-
-                    # ---- 如果没有发现任何弹窗按钮，检查 spinner 是否都消失 ----
-                    if not clicked_any:
-                        try:
-                            spinners = page.locator('mat-spinner')
-                            count = spinners.count()
-                            all_hidden = True
-                            if count > 0:
-                                for i in range(count):
-                                    if spinners.nth(i).is_visible():
-                                        all_hidden = False
-                                        break
-                            if all_hidden:
-                                logger.info("所有加载指示器已消失。页面已完成初步加载且无拦截弹窗。")
-                                break
-                        except Exception:
-                            pass
-
-                    page.wait_for_timeout(1000)
-                    wait_time += 1
-
-                if wait_time >= max_wait:
-                    logger.warning("30秒智能等待结束，页面可能仍有后台加载项，将强制执行后续流程...")
-
-                # 4. 最终鉴权错误检查（防身用）— 检查页面上是否有可见的认证错误文本
+                # 初始化和保活共享弹窗处理；无 spinner 并不代表弹窗已关闭。
                 auth_error_locator = page.get_by_text("authentication error", exact=False)
-                if auth_error_locator.is_visible(timeout=2000):
-                    logger.error(f"检测到认证失败错误。Cookie已过期或无效")
+                if auth_error_locator.first.is_visible():
+                    logger.error("检测到认证失败错误。Cookie已过期或无效")
                     page.screenshot(path=os.path.join(screenshot_dir, f"FAIL_auth_error_{diagnostic_tag}.png"))
                     return
 
-                # 新增检查：确保 App 的 iframe (Preview) 以及 WS 状态元素已经加载出来
-                # 否则说明页面并未真正渲染完毕，过早判定成功会导致保活机制找不到元素
-                logger.info("正在验证 App Preview 框架是否加载...")
+                logger.info("正在等待 AI Studio 弹窗清理、Preview 加载和 WS 连接...")
                 try:
-                    # 等待 iframe 出现
-                    frame_element = page.locator('iframe[title="Preview"]')
-                    frame_element.first.wait_for(state='visible', timeout=15000)
-
-                    # 验证 iframe 内容加载
-                    # get_ws_status() 内部会等待 3 秒找 WS 文本，这里调用一次确保内容已出
-                    from browser.ws_helper import get_ws_status
-                    if get_ws_status(page) == "UNKNOWN":
-                        logger.warning("警告：iframe 已加载，但未检测到 WS 状态文本，可能是网络延迟或页面白屏")
-                except Exception as wait_e:
-                    logger.error(f"App Preview 框架未加载完成: {wait_e}")
-                    raise KeepAliveError("App Preview 框架未能在预期时间内加载完毕，将重试")
+                    wait_for_app_ready(page, logger, timeout=30)
+                except AppReadinessError as error:
+                    logger.error(str(error))
+                    page.screenshot(path=os.path.join(screenshot_dir, f"FAIL_app_not_ready_{diagnostic_tag}.png"))
+                    raise KeepAliveError(str(error)) from error
 
                 # ====== 401 致命错误拦截：仅在页面完全加载后才开始监听 ======
                 # 页面初始化阶段 (goto + 弹窗处理 + iframe加载) 会有大量正常的 401
@@ -637,8 +413,7 @@ def run_browser_instance(config, shutdown_event=None):
                 page.on("response", on_response_post_init)
                 # ====================================================
 
-                # 5. 所有验证通过，确认成功！
-                logger.info("所有验证通过，确认已成功登录并准备就绪")
+                logger.info("初始化验证通过，进入最终就绪检查和保活")
 
                 # 防止窗口被其他实例 100% 盖死（会触发 Firefox occlusion sleep）。
                 # 根因：persistent profile 的 xulstore.json 会让 Firefox 带着

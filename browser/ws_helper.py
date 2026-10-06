@@ -1,6 +1,14 @@
 import time
 import random
+import re
 from playwright.sync_api import Page, FrameLocator
+
+
+_WS_STATUS_PATTERN = re.compile(
+    r"\bWS:\s*(CONNECTED|IDLE|CONNECTING|RECONNECTING|DISCONNECTED|ERROR)\b",
+    re.IGNORECASE,
+)
+_WS_ACTION_TIMEOUT_MS = 5000
 
 def get_context(page: Page, logger=None):
     """
@@ -18,126 +26,62 @@ def get_context(page: Page, logger=None):
 def get_ws_status(page: Page, logger=None) -> str:
     """
     获取页面中WS连接状态。
-    返回: CONNECTED, IDLE, CONNECTING 或 UNKNOWN
+    返回完整的 WS 状态；没有可见状态元素时返回 UNKNOWN。
     """
     try:
         context = get_context(page, logger)
         
-        status_element = context.locator('text=/WS:\\s*(CONNECTED|IDLE|CONNECTING)/i').first
-        if status_element.is_visible(timeout=3000):
-            text = status_element.text_content()
-            if text:
-                if "CONNECTED" in text.upper():
-                    return "CONNECTED"
-                elif "IDLE" in text.upper():
-                    return "IDLE"
-                elif "CONNECTING" in text.upper():
-                    return "CONNECTING"
+        status_elements = context.get_by_text(_WS_STATUS_PATTERN)
+        for index in range(status_elements.count()):
+            status_element = status_elements.nth(index)
+            if not status_element.is_visible():
+                continue
+            match = _WS_STATUS_PATTERN.search(status_element.text_content() or "")
+            if match:
+                return match.group(1).upper()
         return "UNKNOWN"
     except Exception as e:
         if logger:
             logger.warning(f"获取WS状态时出错: {e}")
         return "UNKNOWN"
 
+def _click_ws_action(page: Page, action: str, logger=None, timeout_ms=None) -> bool:
+    """只点击准确命名的 WS 按钮，不绕过 disabled 或遮挡检测。"""
+    try:
+        context = get_context(page, logger)
+        names = re.compile(rf"^{action}(?: WebSocket Proxy)?$", re.IGNORECASE)
+        buttons = context.get_by_role("button", name=names)
+        for index in range(buttons.count()):
+            button = buttons.nth(index)
+            if not button.is_visible():
+                continue
+            button.click(timeout=_WS_ACTION_TIMEOUT_MS if timeout_ms is None else timeout_ms)
+            if logger:
+                logger.info(f"已点击 {action} 按钮")
+            return True
+        if logger:
+            logger.warning(f"未找到可见的 {action} 按钮")
+        return False
+    except Exception as e:
+        if logger:
+            logger.warning(f"点击 {action} 按钮失败: {e}")
+        return False
+
 def click_disconnect(page: Page, logger=None) -> bool:
-    try:
-        context = get_context(page, logger)
+    return _click_ws_action(page, "Disconnect", logger)
 
-        disconnect_btn = context.locator('button:has-text("Disconnect")')
-        if disconnect_btn.count() > 0 and disconnect_btn.first.is_visible(timeout=3000):
-            try:
-                disconnect_btn.first.click(timeout=5000)
-                if logger:
-                    logger.info("已点击 Disconnect 按钮")
-                time.sleep(1)
-                return True
-            except Exception as click_err:
-                if logger:
-                    logger.debug(f"Playwright Disconnect 点击失败，尝试 JS 兜底: {click_err}")
-                page.evaluate("""
-                    () => {
-                        let doc = document;
-                        const iframe = document.querySelector('iframe[title="Preview"]');
-                        if (iframe && iframe.contentDocument) {
-                            doc = iframe.contentDocument;
-                        }
-                        const btn = Array.from(doc.querySelectorAll('button'))
-                            .find(b => b.textContent.includes('Disconnect'));
-                        if (btn) btn.click();
-                    }
-                """)
-                time.sleep(1)
-                return True
-        if logger:
-            logger.warning("未找到可见的 Disconnect 按钮")
-        return False
-    except Exception as e:
-        if logger:
-            logger.warning(f"点击 Disconnect 按钮失败: {e}")
-        return False
-
-def click_connect(page: Page, logger=None) -> bool:
-    try:
-        context = get_context(page, logger)
-
-        connect_btn = context.locator('button:has-text("Connect")')
-        if connect_btn.count() == 0:
-            if logger:
-                logger.warning("未找到 Connect 按钮")
-            return False
-
-        if not connect_btn.first.is_visible(timeout=3000):
-            if logger:
-                logger.warning("Connect 按钮不可见")
-            return False
-
-        try:
-            connect_btn.first.wait_for(state='attached', timeout=15000)
-            start = time.time()
-            while time.time() - start < 15:
-                is_disabled = connect_btn.first.is_disabled()
-                if not is_disabled:
-                    break
-                if logger:
-                    logger.debug("Connect 按钮当前为 disabled，等待可用...")
-                time.sleep(1)
-        except Exception:
-            if logger:
-                logger.warning("等待 Connect 按钮变为可用超时，尝试强制点击")
-
-        try:
-            connect_btn.first.click(timeout=5000)
-        except Exception as click_err:
-            if logger:
-                logger.debug(f"Playwright Connect 点击失败，尝试 JS 兜底: {click_err}")
-            page.evaluate("""
-                () => {
-                    let doc = document;
-                    const iframe = document.querySelector('iframe[title="Preview"]');
-                    if (iframe && iframe.contentDocument) {
-                        doc = iframe.contentDocument;
-                    }
-                    const btn = Array.from(doc.querySelectorAll('button'))
-                        .find(b => b.textContent.includes('Connect'));
-                    if (btn && !btn.disabled) btn.click();
-                }
-            """)
-        if logger:
-            logger.info("已点击 Connect 按钮")
-        time.sleep(1)
-        return True
-    except Exception as e:
-        if logger:
-            logger.warning(f"点击 Connect 按钮失败: {e}")
-        return False
+def click_connect(page: Page, logger=None, timeout_ms=None) -> bool:
+    return _click_ws_action(page, "Connect", logger, timeout_ms)
 
 def wait_for_ws_connected(page: Page, logger=None, timeout: int = 30) -> bool:
-    start_time = time.time()
-    while time.time() - start_time < timeout:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
         status = get_ws_status(page, logger)
         if status == "CONNECTED":
             return True
-        time.sleep(1)
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(1, remaining))
     return False
 
 def reconnect_ws(page: Page, logger=None) -> str:
@@ -150,7 +94,7 @@ def reconnect_ws(page: Page, logger=None) -> str:
     if logger:
         logger.info(f"重连前WS状态: {current_status}")
 
-    if current_status in ("UNKNOWN", "CONNECTING"):
+    if current_status in ("UNKNOWN", "CONNECTING", "RECONNECTING"):
         if logger:
             logger.info(f"检测到过渡态 {current_status}，等待3秒观察是否自行恢复...")
         time.sleep(3)

@@ -8,6 +8,7 @@ import html
 import os
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 try:
@@ -314,6 +315,88 @@ class DialogRegressionTests(unittest.TestCase):
         with self.assertRaises(self.dialogs.AppReadinessError):
             self.dialogs.wait_for_app_ready(self.page, timeout=0.4)
         self.assertLess(time.monotonic() - started, 1.5)
+
+    def test_connected_preview_is_ready_with_unrelated_persistent_editor_progress(self):
+        for progress in (
+            '<div role="progressbar" aria-label="Generating response">Gemini is writing code...</div>',
+            '<mat-spinner aria-label="Editor activity" style="display: block; width: 24px; height: 24px">Loading editor</mat-spinner>',
+        ):
+            with self.subTest(progress=progress):
+                self.set_content(f'<aside aria-label="Code editor"><h2>Gemini</h2>{progress}</aside>')
+                self.assertFalse(self.dialogs.has_visible_dialog(self.page))
+
+                self.assertEqual(self.dialogs.wait_for_app_ready(self.page, timeout=3), "CONNECTED")
+                self.assertTrue(self.page.locator('aside [role="progressbar"], aside mat-spinner').is_visible())
+
+    def test_connected_preview_is_still_blocked_by_modal_with_spinner(self):
+        self.set_content(
+            """
+            <section class="panel" role="dialog" aria-modal="true">
+                <h2>Preparing app permissions</h2>
+                <p>Please wait until permission checks finish.</p>
+                <div role="progressbar" aria-label="Permission checks">Working...</div>
+                <mat-spinner style="display: block; width: 24px; height: 24px">Loading</mat-spinner>
+            </section>
+            """
+        )
+
+        self.assertTrue(self.dialogs.has_visible_dialog(self.page))
+        with self.assertRaises(self.dialogs.AppReadinessError):
+            self.dialogs.wait_for_app_ready(self.page, timeout=0.4)
+        self.assertTrue(self.dialogs.has_visible_dialog(self.page))
+
+    def run_readiness_with_slow_ws_reads(self, observed_times, on_final_read=None):
+        clock = [0.0]
+        reads = []
+        real_get_ws_status = self.dialogs.get_ws_status
+
+        def slow_status_read(page, logger=None):
+            status = real_get_ws_status(page, logger)
+            index = len(reads)
+            self.assertLess(index, len(observed_times), "Unexpected readiness poll")
+            reads.append(status)
+            if index == len(observed_times) - 1 and on_final_read:
+                on_final_read()
+            clock[0] = observed_times[index]
+            return status
+
+        def advance_poll_delay(milliseconds):
+            clock[0] += milliseconds / 1000
+
+        # Replace only the dialog module's clock; Playwright's event loop keeps
+        # using real time while the fixture provides deterministic slow reads.
+        with patch.object(self.dialogs, "time", SimpleNamespace(monotonic=lambda: clock[0])), patch.object(
+            self.dialogs, "get_ws_status", side_effect=slow_status_read
+        ), patch.object(self.page, "wait_for_timeout", side_effect=advance_poll_delay):
+            return self.dialogs.wait_for_app_ready(self.page, timeout=1)
+
+    def test_slow_final_connected_read_after_earlier_healthy_observation_can_succeed(self):
+        self.set_content("")
+
+        self.assertEqual(self.run_readiness_with_slow_ws_reads([0.1, 1.2]), "CONNECTED")
+
+    def test_first_healthy_observation_after_deadline_does_not_count_as_stable(self):
+        self.set_content("")
+
+        with self.assertRaises(self.dialogs.AppReadinessError):
+            self.run_readiness_with_slow_ws_reads([1.2])
+
+    def test_modal_mounted_during_final_slow_ws_read_still_blocks_readiness(self):
+        self.set_content("")
+
+        def mount_blocking_modal():
+            self.page.evaluate("""() => {
+                const modal = document.createElement('section');
+                modal.className = 'panel';
+                modal.setAttribute('role', 'dialog');
+                modal.setAttribute('aria-modal', 'true');
+                modal.innerHTML = '<h2>Review deployment settings</h2><p>Choose an environment.</p>';
+                document.body.appendChild(modal);
+            }""")
+
+        with self.assertRaises(self.dialogs.AppReadinessError):
+            self.run_readiness_with_slow_ws_reads([0.1, 1.2], on_final_read=mount_blocking_modal)
+        self.assertTrue(self.dialogs.has_visible_dialog(self.page))
 
 
 if __name__ == "__main__":

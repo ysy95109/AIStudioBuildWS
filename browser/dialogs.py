@@ -190,7 +190,8 @@ def dismiss_popups(page: Page, logger=None, max_iterations=8, deadline=None) -> 
 
 def wait_for_app_ready(page: Page, logger=None, timeout=30) -> str:
     """Require a clear, rendered Preview and an established WS connection."""
-    deadline = time.monotonic() + timeout
+    started_at = time.monotonic()
+    deadline = started_at + timeout
     clear_since = None
     next_connect_at = 0
     last_status = "UNKNOWN"
@@ -198,10 +199,12 @@ def wait_for_app_ready(page: Page, logger=None, timeout=30) -> str:
     blocking = False
     auth_error = None
     auth_error_since = None
+    last_observation = None
     while time.monotonic() < deadline:
         # One action per poll keeps repeated buttons within the real deadline.
-        dismiss_popups(page, logger, max_iterations=1, deadline=deadline)
-        blocking = has_visible_dialog(page)
+        # The handler already rescans after clicking; reuse its result instead
+        # of repeating all dialog lookups on a busy browser.
+        blocking = not dismiss_popups(page, logger, max_iterations=1, deadline=deadline)
         try:
             if not blocking:
                 _check_preview_authentication(page, deadline)
@@ -216,29 +219,47 @@ def wait_for_app_ready(page: Page, logger=None, timeout=30) -> str:
                 raise
         preview = page.locator('iframe[title="Preview"]').first
         preview_visible = preview.is_visible()
-        loading = page.locator('mat-spinner:visible, [role="progressbar"]:visible').count() > 0
         last_status = get_ws_status(page, logger) if preview_visible else "UNKNOWN"
         now = time.monotonic()
-        if now >= deadline:
-            break
-        if not blocking and not loading and preview_visible and auth_error is None:
-            if last_status == "CONNECTED":
-                if clear_since is None:
-                    clear_since = now
-                # Catch asynchronously mounted onboarding before declaring success.
-                if now - clear_since >= 1:
+        observation = (blocking, preview_visible, last_status, auth_error is not None)
+        if logger and observation != last_observation:
+            logger.info(
+                f"AI Studio 就绪检查 ({now - started_at:.1f}s): "
+                f"blocking_dialog={blocking}, preview_visible={preview_visible}, "
+                f"WS={last_status}, preview_auth_error={auth_error is not None}"
+            )
+        last_observation = observation
+        clear_preview = not blocking and preview_visible and auth_error is None
+        if clear_preview and last_status == "CONNECTED":
+            # Editor/chat progress indicators can remain active after the app
+            # connects. The rendered Preview's WS state establishes readiness.
+            if clear_since is None:
+                clear_since = now
+            # Catch asynchronously mounted onboarding before declaring success.
+            # Assess a completed observation before timing out: slow browser
+            # calls can finish just beyond the budget after an earlier good poll.
+            if now - clear_since >= 1:
+                blocking = has_visible_dialog(page)
+                if not blocking:
                     return last_status
-            else:
+                # A dialog can mount while the Preview/status reads are running.
                 clear_since = None
-                if last_status in ("IDLE", "DISCONNECTED", "ERROR") and now >= next_connect_at:
-                    click_connect(page, logger, timeout_ms=min(1000, (deadline - now) * 1000))
-                    next_connect_at = time.monotonic() + 5
+                clear_preview = False
+                now = time.monotonic()
         else:
             clear_since = None
+        if now >= deadline:
+            break
+        if clear_preview:
+            if last_status in ("IDLE", "DISCONNECTED", "ERROR") and now >= next_connect_at:
+                click_connect(page, logger, timeout_ms=min(1000, (deadline - now) * 1000))
+                next_connect_at = time.monotonic() + 5
         page.wait_for_timeout(min(200, max(0, deadline - time.monotonic()) * 1000))
     if auth_error is not None:
         raise auth_error
+    clear_duration = 0 if clear_since is None else time.monotonic() - clear_since
     raise AppReadinessError(
         f"AI Studio 未准备就绪: blocking_dialog={blocking}, "
-        f"preview_visible={preview_visible}, WS={last_status}"
+        f"preview_visible={preview_visible}, WS={last_status}, "
+        f"connected_clear_for={clear_duration:.1f}s"
     )
